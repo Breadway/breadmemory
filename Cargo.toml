@@ -1,0 +1,26 @@
+[package]
+name = "breadmemory"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first, assistant-agnostic archive of ChatGPT conversations"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

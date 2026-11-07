@@ -151,6 +151,44 @@ impl FileIndex {
     }
 }
 
+fn normalize_asset_names(raw: HashMap<String, String>) -> HashMap<String, String> {
+    raw.into_iter()
+        .filter_map(|(path, name)| {
+            let stem = Path::new(&path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or(&path);
+            let key = normalize_id(stem);
+            if key.is_empty() {
+                None
+            } else {
+                Some((key, name))
+            }
+        })
+        .collect()
+}
+
+/// The official export includes a map from downloaded asset filenames to the
+/// original upload names. Metadata attachments usually carry a name already;
+/// asset pointers do not, so this fills the gap.
+fn load_asset_names(archive: &mut ExportArchive) -> HashMap<String, String> {
+    let Some(file_name) = archive
+        .names()
+        .iter()
+        .find(|name| name.rsplit('/').next() == Some("conversation_asset_file_names.json"))
+        .cloned()
+    else {
+        return HashMap::new();
+    };
+    let Ok(bytes) = archive.read(&file_name) else {
+        return HashMap::new();
+    };
+    let Ok(raw) = serde_json::from_slice::<HashMap<String, String>>(&bytes) else {
+        return HashMap::new();
+    };
+    normalize_asset_names(raw)
+}
+
 pub fn import(conn: &mut Connection, path: &Path, options: &ImportOptions) -> Result<ImportReport> {
     let started = Instant::now();
     let mut archive = ExportArchive::open(path)?;
@@ -163,6 +201,7 @@ pub fn import(conn: &mut Connection, path: &Path, options: &ImportOptions) -> Re
     }
     let fingerprint = archive.fingerprint(path)?;
     let file_index = FileIndex::build(archive.names());
+    let asset_names = load_asset_names(&mut archive);
     let source_kind = archive.kind().as_str().to_string();
     let started_at = now_iso();
 
@@ -236,6 +275,7 @@ pub fn import(conn: &mut Connection, path: &Path, options: &ImportOptions) -> Re
                 element,
                 import_id,
                 &file_index,
+                &asset_names,
                 options.force,
             );
             match outcome {
@@ -314,6 +354,7 @@ fn process_conversation(
     raw_bytes: &[u8],
     import_id: i64,
     file_index: &FileIndex,
+    asset_names: &HashMap<String, String>,
     force: bool,
 ) -> Result<Outcome> {
     let conversation_id = conversation
@@ -677,11 +718,15 @@ fn process_conversation(
             } else {
                 "missing"
             };
+            let attachment_name = reference
+                .name
+                .clone()
+                .or_else(|| asset_names.get(&normalize_id(&reference.file_id)).cloned());
             let inserted = attachment_stmt.execute(params![
                 reference.file_id,
                 conversation_id,
                 reference.node_id,
-                reference.name,
+                attachment_name,
                 reference.mime_type,
                 reference.size_bytes,
                 reference.source,
@@ -950,4 +995,28 @@ pub fn reindex(conn: &mut Connection, db_path: &Path) -> Result<ReindexReport> {
 pub fn rebuild_fts(conn: &Connection) -> Result<()> {
     conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')", [])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asset_name_keys_strip_extension_and_normalise() {
+        let mut raw = HashMap::new();
+        raw.insert("file_000abc.dat".to_string(), "photo.png".to_string());
+        raw.insert(
+            "file-inline-libfile_x-1.dat".to_string(),
+            "CLI.md".to_string(),
+        );
+        let names = normalize_asset_names(raw);
+        assert_eq!(
+            names.get("file000abc").map(String::as_str),
+            Some("photo.png")
+        );
+        assert_eq!(
+            names.get("fileinlinelibfilex1").map(String::as_str),
+            Some("CLI.md")
+        );
+    }
 }

@@ -291,6 +291,7 @@ fn run() -> Result<()> {
             let mut options = ImportOptions::new(home.clone());
             options.force = force;
             options.extract_attachments = !no_attachments;
+            options.progress = true;
             let report = importer::import(&mut conn, &path, &options)?;
             if json {
                 print_json(&report.to_json())?;

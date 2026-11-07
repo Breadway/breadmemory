@@ -79,7 +79,7 @@ that directory: `archive.db` plus `attachments/`.
 | `eval <cases.json>` | Run retrieval evaluation (recall@k, MRR) |
 | `show <id/prefix/title>` | Print a conversation (active branch by default) |
 | `context-window <message>` | Print a message plus surrounding branch context |
-| `related --message <id>` | Find related discussions |
+| `related --message <id>` | Find related discussions with hybrid retrieval |
 | `context ...` | Manage the current-context layer |
 | `raw <conversation>` | Print the preserved original JSON |
 | `reindex` | Rebuild chunks and FTS from stored messages |
@@ -290,7 +290,7 @@ Tools:
 | `search_conversations` | Hybrid BM25 plus semantic search with surrounding messages |
 | `get_conversation` | Full conversation, active branch or all branches |
 | `get_context` | Message plus surrounding branch context |
-| `find_related` | Related discussions |
+| `find_related` | Related discussions, hybrid when embeddings exist |
 | `get_current_context` | Current facts, pinned first, optional relevance ranking |
 | `propose_current_context` | Propose a fact with provenance; stored as `proposed` by default |
 

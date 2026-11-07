@@ -235,13 +235,14 @@ pub fn render_context(result: &ContextResult) -> String {
     out
 }
 
-pub fn render_related(groups: &[RelatedGroup]) -> String {
+pub fn render_related(groups: &[RelatedGroup], mode: &str) -> String {
     if groups.is_empty() {
         return "No related conversations found.\n".to_string();
     }
     let mut out = format!(
-        "{} related conversation(s) (keyword similarity)\n\n",
-        groups.len()
+        "{} related conversation(s) ({} similarity)\n\n",
+        groups.len(),
+        mode
     );
     for (index, group) in groups.iter().enumerate() {
         out.push_str(&format!(

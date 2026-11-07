@@ -119,7 +119,7 @@ fn call_tool(
         "search_conversations" => tool_search(conn, embedder, model_dir, &args),
         "get_conversation" => tool_get_conversation(conn, &args),
         "get_context" => tool_get_context(conn, &args),
-        "find_related" => tool_find_related(conn, &args),
+        "find_related" => tool_find_related(conn, embedder, model_dir, &args),
         "get_current_context" => tool_get_current_context(conn, &args),
         "propose_current_context" => tool_propose_current_context(conn, &args),
         other => Err(anyhow!("unknown tool: {other}")),
@@ -283,9 +283,15 @@ fn tool_get_context(conn: &Connection, args: &Value) -> Result<Value> {
     ))
 }
 
-fn tool_find_related(conn: &Connection, args: &Value) -> Result<Value> {
+fn tool_find_related(
+    conn: &Connection,
+    embedder: &mut Option<Embedder>,
+    model_dir: &Path,
+    args: &Value,
+) -> Result<Value> {
     let limit = int_arg(args, "limit", 8, 1, 25);
     let include_hidden = bool_arg(args, "include_hidden", false);
+    let requested_mode = optional_str(args, "mode").unwrap_or_else(|| "auto".to_string());
     let (text, exclude) = match optional_str(args, "message_id") {
         Some(reference) => {
             let conversation = optional_str(args, "conversation_id");
@@ -295,11 +301,34 @@ fn tool_find_related(conn: &Connection, args: &Value) -> Result<Value> {
         }
         None => (required_str(args, "query")?, None),
     };
-    let groups = search::find_related(conn, &text, exclude.as_deref(), limit, include_hidden)?;
+
+    let embedding_status = embedding::status(conn)?;
+    if requested_mode != "keyword" && embedding_status.ready && embedder.is_none() {
+        match Embedder::load(model_dir) {
+            Ok(loaded) => *embedder = Some(loaded),
+            Err(err) if requested_mode == "auto" => {
+                eprintln!("breadmemory: related semantic lane unavailable ({err:#})");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let embedder_ref = if requested_mode == "keyword" || !embedding_status.ready {
+        None
+    } else {
+        embedder.as_mut()
+    };
+    let (groups, mode) = search::find_related(
+        conn,
+        embedder_ref,
+        &text,
+        exclude.as_deref(),
+        limit,
+        include_hidden,
+    )?;
     Ok(historical_envelope(
         conn,
         json!({
-            "mode": "keyword",
+            "mode": mode,
             "related": search::related_json(&groups),
         }),
     ))
@@ -539,13 +568,14 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "find_related",
-            "description": "Find other archived conversations related to a message or query. Currently keyword similarity, not embeddings; results are labelled accordingly.",
+            "description": "Find other archived conversations related to a message or query. Uses hybrid BM25 plus semantic similarity when embeddings exist, otherwise keyword similarity; reports the mode.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Topic text to find related discussions for." },
                     "message_id": { "type": "string", "description": "Use this archived message's text instead of a query." },
                     "conversation_id": { "type": "string", "description": "Conversation containing message_id." },
+                    "mode": { "type": "string", "enum": ["auto", "keyword"], "default": "auto" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 8 },
                     "include_hidden": { "type": "boolean", "default": false }
                 }

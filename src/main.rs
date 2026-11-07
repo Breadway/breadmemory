@@ -507,14 +507,35 @@ fn run() -> Result<()> {
                     (query.join(" "), None)
                 }
             };
-            let groups = search::find_related(&conn, &text, exclude.as_deref(), limit, false)?;
+            let embedding_status = embedding::status(&conn)?;
+            let mut embedder = if embedding_status.ready {
+                match embedding::Embedder::load(&embedding::default_model_dir(&home)) {
+                    Ok(loaded) => Some(loaded),
+                    Err(err) => {
+                        eprintln!(
+                            "breadmemory: semantic relatedness unavailable ({err:#}); using keyword"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let (groups, mode) = search::find_related(
+                &conn,
+                embedder.as_mut(),
+                &text,
+                exclude.as_deref(),
+                limit,
+                false,
+            )?;
             if json {
                 print_json(&json!({
-                    "mode": "keyword",
+                    "mode": mode,
                     "related": search::related_json(&groups),
                 }))?;
             } else {
-                print!("{}", render::render_related(&groups));
+                print!("{}", render::render_related(&groups, mode));
             }
             Ok(())
         }

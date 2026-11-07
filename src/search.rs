@@ -1058,23 +1058,27 @@ pub fn get_context(
 
 pub fn find_related(
     conn: &Connection,
+    embedder: Option<&mut crate::embedding::Embedder>,
     text: &str,
     exclude_conversation: Option<&str>,
     limit: usize,
     include_hidden: bool,
-) -> Result<Vec<RelatedGroup>> {
+) -> Result<(Vec<RelatedGroup>, &'static str)> {
     let terms = keywords(text, 16);
-    if terms.is_empty() {
-        bail!("not enough distinctive terms to find related discussions");
-    }
-    let query = terms.join(" ");
     let options = SearchOptions {
         limit: (limit * 6).clamp(12, 200),
         include_hidden,
         exclude_conversation_id: exclude_conversation.map(str::to_string),
         ..Default::default()
     };
-    let hits = search_keyword(conn, &query, &options)?;
+    let (hits, mode) = if let Some(embedder) = embedder {
+        search_hybrid(conn, embedder, text, &options, false, false, 60.0)?
+    } else {
+        if terms.is_empty() {
+            bail!("not enough distinctive terms to find related discussions");
+        }
+        (search_keyword(conn, &terms.join(" "), &options)?, "keyword")
+    };
 
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, RelatedGroup> = HashMap::new();
@@ -1106,7 +1110,7 @@ pub fn find_related(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     results.truncate(limit);
-    Ok(results)
+    Ok((results, mode))
 }
 
 pub fn list_conversations(

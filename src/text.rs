@@ -38,7 +38,7 @@ pub fn extract_text(msg: &RawMessage) -> String {
         text = thoughts_text(content);
     }
 
-    strip_citation_markers(&text).trim().to_string()
+    render_inline_markers(&text).trim().to_string()
 }
 
 fn parts_text(content: &RawContent, content_type: &str) -> String {
@@ -153,19 +153,25 @@ fn value_text(value: &Value) -> Option<String> {
     }
 }
 
-/// Remove ChatGPT's citation spans. They are opaque markers such as
-/// `\u{e200}cite\u{e202}turn0file0\u{e201}` or `【cite】【turn0file0】`;
-/// user-written CJK brackets are left alone.
-pub fn strip_citation_markers(input: &str) -> String {
+/// Render ChatGPT's inline private-use markers. Citation markers are removed;
+/// markers that carry a human-readable name (links, entities, products,
+/// reactions) keep that name so searchable text is not silently lost.
+///
+/// Formats look like `\u{e200}url\u{e202}Title\u{e202}turn0search1\u{e201}`.
+/// The third field is a retrieval token, not a fetchable URL, so it is dropped.
+pub fn render_inline_markers(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{e200}' {
+            let mut inner = String::new();
             for n in chars.by_ref() {
                 if n == '\u{e201}' {
                     break;
                 }
+                inner.push(n);
             }
+            out.push_str(&render_marker(&inner));
             continue;
         }
         if c == '【' {
@@ -187,6 +193,82 @@ pub fn strip_citation_markers(input: &str) -> String {
         out.push(c);
     }
     out
+}
+
+fn render_marker(inner: &str) -> String {
+    let parts: Vec<&str> = inner.split('\u{e202}').collect();
+    match parts.first().copied().unwrap_or_default() {
+        "url" => parts
+            .get(1)
+            .filter(|title| !title.trim().is_empty())
+            .map(|title| title.to_string())
+            .unwrap_or_else(|| "[link]".to_string()),
+        "video" => parts
+            .get(1)
+            .filter(|title| !title.trim().is_empty())
+            .map(|title| title.to_string())
+            .unwrap_or_else(|| "[video]".to_string()),
+        "entity" | "product" => marker_array_name(parts.get(1).copied()),
+        "products" => marker_product_names(parts.get(1).copied()),
+        "message_reaction" => parts
+            .get(1)
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        "visualize" => marker_visualization(parts.get(1).copied()),
+        "image_group" => "[images]".to_string(),
+        "map" => "[map]".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn marker_array_name(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return String::new();
+    };
+    match value {
+        Value::Array(items) => items
+            .get(1)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        Value::String(text) => text,
+        _ => String::new(),
+    }
+}
+
+fn marker_product_names(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return String::new();
+    };
+    let mut names = Vec::new();
+    if let Some(rows) = value.get("selections").and_then(Value::as_array) {
+        for row in rows {
+            if let Some(name) = row.get(1).and_then(Value::as_str) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.join(", ")
+}
+
+fn marker_visualization(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return "[visualization]".to_string();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return "[visualization]".to_string();
+    };
+    value
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| format!("[visualization: {path}]"))
+        .unwrap_or_else(|| "[visualization]".to_string())
 }
 
 pub fn meta_bool(meta: Option<&Value>, key: &str) -> bool {
@@ -390,9 +472,18 @@ mod tests {
     }
 
     #[test]
-    fn strips_only_citation_brackets() {
+    fn strips_citations_but_keeps_names() {
         let raw = "a\u{e200}cite\u{e202}turn0file0\u{e201}b 【cite】【turn1view2】c 【注】";
-        assert_eq!(strip_citation_markers(raw), "ab c 【注】");
+        assert_eq!(render_inline_markers(raw), "ab c 【注】");
+
+        let link = "**\u{e200}url\u{e202}Odysseus\u{e202}turn0search1\u{e201}** is a workspace";
+        assert_eq!(render_inline_markers(link), "**Odysseus** is a workspace");
+
+        let entity = "\u{e200}entity\u{e202}[\"turn0business3\",\"Myer Carousel\"]\u{e201}";
+        assert_eq!(render_inline_markers(entity), "Myer Carousel");
+
+        let products = "\u{e200}products\u{e202}{\"selections\":[[\"p1\",\"Samsung G5\"],[\"p2\",\"MSI MAG\"]]}\u{e201}";
+        assert_eq!(render_inline_markers(products), "Samsung G5, MSI MAG");
     }
 
     #[test]

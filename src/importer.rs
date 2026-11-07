@@ -248,7 +248,7 @@ pub fn import(conn: &mut Connection, path: &Path, options: &ImportOptions) -> Re
         let tx = conn.transaction()?;
         for (index, element) in elements.iter().enumerate() {
             report.conversations_seen += 1;
-            if options.progress && report.conversations_seen % 250 == 0 {
+            if options.progress && report.conversations_seen.is_multiple_of(250) {
                 eprintln!(
                     "breadmemory: {} conversations seen, {} new, {} updated, {} unchanged, {} failed",
                     report.conversations_seen,
@@ -827,12 +827,14 @@ fn extract_pending_attachments(
     options: &ImportOptions,
     report: &mut ImportReport,
 ) -> Result<()> {
-    let pending: Vec<(String, Option<String>)> = {
+    let pending: Vec<PendingAttachment> = {
         let mut stmt = conn.prepare(
-            "SELECT file_id, MAX(archive_path) FROM attachments
+            "SELECT file_id, MAX(archive_path), MAX(name), MAX(mime_type) FROM attachments
              WHERE status = 'referenced' GROUP BY file_id",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
         let mut values = Vec::new();
         for row in rows {
             values.push(row?);
@@ -840,7 +842,7 @@ fn extract_pending_attachments(
         values
     };
 
-    for (file_id, archive_path) in pending {
+    for (file_id, archive_path, name, mime_type) in pending {
         let Some(archive_path) = archive_path else {
             conn.execute(
                 "UPDATE attachments SET status = 'missing' WHERE file_id = ?1 AND status = 'referenced'",
@@ -860,7 +862,9 @@ fn extract_pending_attachments(
             }
         };
         let digest = sha256_hex(&bytes);
-        let extension = sanitized_extension(&archive_path);
+        let extension = extension_from_name(name.as_deref())
+            .or_else(|| extension_from_mime(mime_type.as_deref()))
+            .unwrap_or_else(|| sanitized_extension(&archive_path));
         let subdir = &digest[..2];
         let dir = options.attachment_dir.join(subdir);
         ensure_private_dir(&dir)?;
@@ -886,18 +890,48 @@ fn extract_pending_attachments(
 }
 
 fn sanitized_extension(path: &str) -> String {
-    Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            ext.chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .take(12)
-                .collect::<String>()
-                .to_ascii_lowercase()
-        })
-        .filter(|ext| !ext.is_empty())
-        .unwrap_or_else(|| "bin".to_string())
+    extension_from_name(Some(path)).unwrap_or_else(|| "bin".to_string())
+}
+
+fn extension_from_name(name: Option<&str>) -> Option<String> {
+    let name = name?;
+    let extension = Path::new(name).extension()?.to_str()?;
+    let cleaned: String = extension
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn extension_from_mime(mime: Option<&str>) -> Option<String> {
+    let mime = mime?;
+    let base = mime.split(';').next()?.trim().to_ascii_lowercase();
+    let extension = match base.as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        "text/markdown" => "md",
+        "text/csv" => "csv",
+        "application/json" => "json",
+        "application/zip" => "zip",
+        "audio/mpeg" => "mp3",
+        "audio/wav" => "wav",
+        "video/mp4" => "mp4",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        _ => return None,
+    };
+    Some(extension.to_string())
 }
 
 pub struct ReindexReport {
@@ -915,6 +949,8 @@ type ReindexRow = (
     String,
     String,
 );
+
+type PendingAttachment = (String, Option<String>, Option<String>, Option<String>);
 
 /// Rebuild chunks and the FTS index from the preserved message rows. The
 /// current context layer is deliberately untouched.
@@ -1018,5 +1054,21 @@ mod tests {
             names.get("fileinlinelibfilex1").map(String::as_str),
             Some("CLI.md")
         );
+    }
+
+    #[test]
+    fn chooses_useful_attachment_extensions() {
+        assert_eq!(
+            extension_from_name(Some("photo.PNG")).as_deref(),
+            Some("png")
+        );
+        assert_eq!(extension_from_name(Some("image")), None);
+        assert_eq!(
+            extension_from_mime(Some("image/jpeg; charset=binary")).as_deref(),
+            Some("jpg")
+        );
+        assert_eq!(extension_from_mime(Some("application/octet-stream")), None);
+        assert_eq!(sanitized_extension("file_abc.dat"), "dat");
+        assert_eq!(sanitized_extension("no-extension"), "bin");
     }
 }

@@ -29,15 +29,14 @@ Implemented:
 - MCP server with `search_conversations`, `get_conversation`, `get_context`,
   `find_related`
 - Current-context layer with provenance, audit events, pinned facts, proposals
-- Odysseus memory import/export bridge
+- Two-way Odysseus memory sync, including automatic native injection
+- Local ONNX embeddings and exact cosine vector search
+- Hybrid BM25 plus semantic retrieval fused with Reciprocal Rank Fusion
+- Retrieval evaluation harness with recall@k and MRR
 
-Not yet implemented:
-
-- Local ONNX embeddings and vector search (phase 5)
-- Reciprocal Rank Fusion of keyword and semantic results (phase 6)
-- Retrieval evaluation harness (phase 7)
-
-`search_conversations` reports `"mode": "keyword"` until phase 5 lands.
+The MCP search tool reports `"mode": "hybrid"`, `"semantic"` or `"keyword"`
+depending on what ran. It falls back to keyword when embeddings or the model
+are unavailable.
 
 ## Build
 
@@ -54,6 +53,7 @@ compiled in with FTS5 enabled.
 ```sh
 breadmemory init
 breadmemory import ~/Downloads/chatgpt-export.zip
+breadmemory embed
 breadmemory status
 breadmemory search zfs arc_max
 breadmemory conversations --limit 10
@@ -74,7 +74,9 @@ that directory: `archive.db` plus `attachments/`.
 | `import <path>` | Import a zip or extracted export directory |
 | `status [--json]` | Counts, size, schema version, last import |
 | `conversations` | List conversations, newest first |
-| `search <query>` | FTS5 keyword search with source ids and timestamps |
+| `search <query>` | Hybrid BM25 plus semantic search with source ids and timestamps |
+| `embed` | Generate local ONNX embeddings for unembedded chunks |
+| `eval <cases.json>` | Run retrieval evaluation (recall@k, MRR) |
 | `show <id/prefix/title>` | Print a conversation (active branch by default) |
 | `context-window <message>` | Print a message plus surrounding branch context |
 | `related --message <id>` | Find related discussions |
@@ -86,7 +88,12 @@ that directory: `archive.db` plus `attachments/`.
 
 Search flags: `--limit`, `--role user|assistant|tool|system`, `--after`,
 `--before` (YYYY-MM-DD, RFC 3339 or unix seconds), `--include-hidden`,
-`--json`.
+`--keyword-only`, `--rrf-k`, `--json`.
+
+`embed` flags: `--batch-size`, `--limit`, `--all`, `--json`. It embeds only
+chunks without vectors unless `--all` is passed.
+
+`eval` flags: `--k`, `--compare` (keyword and hybrid), `--json`.
 
 `show` flags: `--all-branches`, `--include-hidden`, `--max-chars`, `--json`.
 
@@ -115,6 +122,56 @@ Formats handled: `text`, `multimodal_text`, `code`, `execution_output`,
 `user_editable_context`, `model_editable_context`, audio transcriptions and
 asset pointers. Citation markers are stripped from extracted text, not from the
 preserved raw JSON.
+
+## Local embeddings
+
+Embeddings run in-process with ONNX Runtime. No hosted service and no Python
+dependency is used by breadmemory itself.
+
+Model files live in `<data>/models/all-MiniLM-L6-v2/`:
+
+- `model.onnx`
+- `tokenizer.json`
+
+Override the directory with `BREADMEMORY_MODEL_DIR`. The model is
+`sentence-transformers/all-MiniLM-L6-v2`, 384 dimensions, mean-pooled and
+L2-normalised. The same model is used by Odysseus, so vectors occupy the same
+semantic space.
+
+ONNX Runtime is loaded dynamically. If the library is not on the system loader
+path, set `ORT_DYLIB_PATH`:
+
+```sh
+export ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so
+breadmemory embed
+```
+
+`embed` prints progress and stores vectors in `chunk_embeddings`. Embeddings
+are derived data: `reindex` deletes and rebuilds chunks, then `embed` fills the
+vectors again. A missing model or runtime degrades search to keyword mode
+instead of failing.
+
+## Retrieval evaluation
+
+`eval` measures keyword and hybrid retrieval against a labelled JSON file:
+
+```json
+[
+  {
+    "query": "which drill did I get for my birthday",
+    "expected_conversation_ids": ["..."],
+    "expected_message_ids": ["..."]
+  }
+]
+```
+
+```sh
+breadmemory eval cases.json --k 5 --compare
+```
+
+It reports recall@k, MRR and average latency for each mode. `--json` emits the
+same metrics plus per-case ranks for comparing chunk sizes, RRF constants or
+future model changes.
 
 ## Storage
 
@@ -184,6 +241,21 @@ breadmemory context export --out context.json
 breadmemory context import context.json --replace
 ```
 
+Two-way Odysseus sync:
+
+```sh
+breadmemory context sync-odysseus ~/odysseus/data/memory.json --owner breadway
+```
+
+This imports new or edited native memories and projects active facts back into
+`memory.json` as native-compatible entries. Each projection stores
+`projected_text`, so an edit made in Odysseus is detected and imported on the
+next pass. Retracting a fact removes its projection. On Hestia this runs every
+30 seconds through a systemd user timer.
+
+Use `--status proposed` to add a proposal instead of an active fact. MCP clients
+already do this by default.
+
 ## MCP
 
 Register the binary as a stdio MCP server. In Odysseus, `manage_mcp add` accepts:
@@ -194,10 +266,15 @@ Register the binary as a stdio MCP server. In Odysseus, `manage_mcp add` accepts
   "command": "/home/breadway/.local/bin/breadmemory",
   "args": ["serve"],
   "env": {
-    "BREADMEMORY_DB": "/home/breadway/.local/share/breadmemory/archive.db"
+    "BREADMEMORY_DB": "/home/breadway/.local/share/breadmemory/archive.db",
+    "BREADMEMORY_MODEL_DIR": "/home/breadway/.local/share/breadmemory/models/all-MiniLM-L6-v2",
+    "ORT_DYLIB_PATH": "/usr/lib/libonnxruntime.so"
   }
 }
 ```
+
+The model and runtime variables are optional; without them the server falls
+back to keyword search.
 
 Odysseus refuses interpreters and package runners on the agent-reachable
 `manage_mcp` path. A compiled binary needs to be allowlisted by the operator:
@@ -210,10 +287,10 @@ Tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `search_conversations` | Keyword search with surrounding messages |
+| `search_conversations` | Hybrid BM25 plus semantic search with surrounding messages |
 | `get_conversation` | Full conversation, active branch or all branches |
 | `get_context` | Message plus surrounding branch context |
-| `find_related` | Related discussions (keyword similarity for now) |
+| `find_related` | Related discussions |
 | `get_current_context` | Current facts, pinned first, optional relevance ranking |
 | `propose_current_context` | Propose a fact with provenance; stored as `proposed` by default |
 
@@ -242,7 +319,7 @@ Odysseus stores memories as `{id, text, category, source, session_id, timestamp,
 pinned}` in `memory.json`, and injects pinned facts plus relevant recall each
 turn. The current-context layer maps onto that directly.
 
-Import Odysseus memories:
+Import remains available for a one-way pull:
 
 ```sh
 breadmemory context import-odysseus ~/odysseus/data/memory.json
@@ -253,11 +330,11 @@ Import is idempotent by Odysseus memory id, preserves pinned state, and never
 resurrects a fact you retracted in breadmemory. New facts get a key like
 `odysseus.identity.riley_lives_sydney_teaches_school.ca51ae`.
 
-Treat this as a one-way migration or pull, not continuous two-way sync. While
-you keep re-running the import, Odysseus remains the source of truth for those
-facts and will overwrite a breadmemory edit to the same synced row. Once the
-migration is done, stop importing and use the breadmemory CLI (or accepted MCP
-proposals) as the single writer. The export command is the way back.
+For continuous use, prefer `sync-odysseus` (above). It performs the import and
+the projection in one pass, records `projected_text`, and detects edits made in
+either system. If both sides change between syncs, the Odysseus-side edit wins
+and is projected back. Deleting a projected entry in Odysseus does not delete
+it in breadmemory; retract it in breadmemory instead.
 
 Export back:
 
@@ -271,20 +348,18 @@ pinned flags. Note that Odysseus' `/api/memory/import` endpoint only reads
 and pinned flags means replacing `memory.json` while Odysseus is stopped, or
 using the API add/pin endpoints.
 
-Two integration levels are possible:
+Integration levels:
 
-1. **Now, no Odysseus changes**: MCP tools supply current context and archive
-   retrieval. `get_current_context` is the read path.
-2. **Later, native provider**: Odysseus has a `MemoryProvider` interface
-   (`remember`, `recall`, `list_memories`, `delete`) and injects memory in
-   `ChatProcessor`. A small provider adapter can call `breadmemory context
-   recall` for pinned plus relevant facts. Deferred until the real export and
-   the Odysseus switchover are in place.
+1. **Live sync bridge (deployed)**: the systemd timer keeps `memory.json`
+   aligned with current context. Odysseus injects the projected facts on every
+   turn without code changes, and new native memories flow back to breadmemory.
+2. **Optional provider adapter**: `integrations/odysseus/breadmemory_provider.py`
+   implements Odysseus' `MemoryProvider` interface for provider-aware APIs. It
+   writes proposals, not active facts. Use it instead of, not alongside, the
+   projection if duplicate listings matter.
 
-Recommendation: keep Odysseus' native memory for session-scoped automatic
-extraction during the transition, and make breadmemory's current context the
-durable, portable source of truth. Do not run two competing definitions of the
-same fact.
+Recommendation: keep breadmemory's current context as the durable, portable
+source of truth. The projection is a delivery mechanism, not a second store.
 
 ## Privacy and untrusted data
 
@@ -319,15 +394,22 @@ The integration test builds a synthetic export with a regenerated branch, a
 hidden system message, a fenced code block, an attachment and a legacy flat
 conversation, imports it from a directory and from a zip, and verifies
 idempotency, branch preservation, context ordering, attachments, reindexing and
-raw JSON retention.
+raw JSON retention. Unit tests cover chunking, marker rendering, FTS query
+building, RRF metrics and the two-way memory sync. ONNX inference is exercised
+manually because CI does not ship the model or runtime.
 
 ## Roadmap
 
-5. Local embeddings: ONNX Runtime (`ort`) plus a small sentence-transformer,
-   vectors in sqlite-vec, chunk-level semantic index.
-6. Hybrid retrieval: RRF over BM25 and vector rankings, with mode reporting.
-7. Retrieval evaluation: a fixed question set over the real archive, measuring
-   recall@k, MRR and context quality, then tuning chunk size, weights and RRF k.
+Completed:
 
-Also planned: conflict detection between current context and archive,
-context fact merge/dedupe review, and the Odysseus provider adapter.
+- local ONNX embeddings over chunk text
+- exact cosine vector search stored in SQLite
+- hybrid retrieval with RRF and mode reporting
+- evaluation harness with recall@k and MRR
+
+Next:
+
+- conflict detection between current context and archive
+- context fact merge and dedupe review
+- tune chunk size, BM25 weights and RRF k against a larger labelled set
+- optional sqlite-vec backend if the archive grows well beyond 100k chunks

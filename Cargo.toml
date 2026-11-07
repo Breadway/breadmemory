@@ -9,11 +9,13 @@ license = "MIT"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-27"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
+tokenizers = "0.22"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 zstd = "0.13"
 

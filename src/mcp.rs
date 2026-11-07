@@ -339,10 +339,22 @@ fn tool_get_current_context(conn: &Connection, args: &Value) -> Result<Value> {
     let query = optional_str(args, "query");
     let limit = int_arg(args, "limit", 50, 1, 200);
     let include_proposed = bool_arg(args, "include_proposed", false);
+    let include_inactive = bool_arg(args, "include_inactive", false);
     let pinned_only = bool_arg(args, "pinned_only", false);
 
     let mut facts: Vec<Value> = Vec::new();
-    if let Some(query) = query.as_deref() {
+    if include_inactive {
+        let statuses = context::STATUSES.to_vec();
+        for fact in context::list(conn, &statuses, category.as_deref(), query.as_deref())? {
+            if pinned_only && !fact.pinned {
+                continue;
+            }
+            facts.push(context::fact_to_json(&fact));
+            if facts.len() >= limit {
+                break;
+            }
+        }
+    } else if let Some(query) = query.as_deref() {
         let scored = context::recall(conn, query, (limit * 4).min(400), include_proposed)?;
         for result in scored {
             if let Some(category) = category.as_deref() {
@@ -382,8 +394,13 @@ fn tool_get_current_context(conn: &Connection, args: &Value) -> Result<Value> {
         "temporal": {
             "kind": "current",
             "retrieved_at": now_iso(),
-            "notice": "These are explicit, human-managed current facts. They are not generated from the archive and take precedence over archived statements when they conflict. Report any conflict between this layer and the archive to the user instead of silently choosing one.",
+            "notice": if include_inactive {
+                "Includes superseded and retracted facts. Check each fact's status before using it; only active facts are current."
+            } else {
+                "These are explicit, human-managed current facts. They are not generated from the archive and take precedence over archived statements when they conflict. Report any conflict between this layer and the archive to the user instead of silently choosing one."
+            },
         },
+        "includes_inactive": include_inactive,
         "fact_count": facts.len(),
         "facts": facts,
     }))
@@ -591,6 +608,7 @@ fn tool_definitions() -> Vec<Value> {
                     "query": { "type": "string", "description": "Filter facts by key, value or note text." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
                     "include_proposed": { "type": "boolean", "default": false, "description": "Also show proposals that the user has not accepted yet." },
+                    "include_inactive": { "type": "boolean", "default": false, "description": "Include superseded and retracted facts. Check each fact's status before use." },
                     "pinned_only": { "type": "boolean", "default": false, "description": "Only return pinned, always-inject facts." }
                 }
             }

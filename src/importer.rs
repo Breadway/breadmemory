@@ -15,6 +15,7 @@ use crate::util::{ensure_private_dir, normalize_id, now_iso, restrict_permission
 pub struct ImportOptions {
     pub force: bool,
     pub extract_attachments: bool,
+    pub progress: bool,
     pub data_dir: PathBuf,
     pub attachment_dir: PathBuf,
 }
@@ -25,6 +26,7 @@ impl ImportOptions {
         Self {
             force: false,
             extract_attachments: true,
+            progress: false,
             data_dir,
             attachment_dir,
         }
@@ -183,16 +185,40 @@ pub fn import(conn: &mut Connection, path: &Path, options: &ImportOptions) -> Re
         ..Default::default()
     };
 
+    if options.progress {
+        eprintln!(
+            "breadmemory: importing {} ({} conversation file(s))",
+            path.display(),
+            conversation_files.len()
+        );
+    }
+
     for file_name in &conversation_files {
         let bytes = archive
             .read(file_name)
             .with_context(|| format!("read conversation file {file_name}"))?;
+        if options.progress {
+            eprintln!(
+                "breadmemory: reading {file_name} ({:.1} MiB)",
+                bytes.len() as f64 / (1024.0 * 1024.0)
+            );
+        }
         let elements = split_json_array(&bytes)
             .with_context(|| format!("parse conversation array in {file_name}"))?;
 
         let tx = conn.transaction()?;
         for (index, element) in elements.iter().enumerate() {
             report.conversations_seen += 1;
+            if options.progress && report.conversations_seen % 250 == 0 {
+                eprintln!(
+                    "breadmemory: {} conversations seen, {} new, {} updated, {} unchanged, {} failed",
+                    report.conversations_seen,
+                    report.conversations_new,
+                    report.conversations_updated,
+                    report.conversations_unchanged,
+                    report.conversations_failed
+                );
+            }
             let conversation: RawConversation = match serde_json::from_slice(element) {
                 Ok(value) => value,
                 Err(err) => {

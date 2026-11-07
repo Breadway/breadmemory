@@ -66,6 +66,13 @@ pub fn render_status(status: &ArchiveStatus) -> String {
         "  context:       {} active fact(s), {} proposed\n",
         status.context_active, status.context_proposed
     ));
+    out.push_str(&format!(
+        "  embeddings:    {} / {} chunks ({:.1}%), model {}\n",
+        status.embedding.embedded_chunks,
+        status.embedding.total_chunks,
+        status.embedding.coverage() * 100.0,
+        status.embedding.model.as_deref().unwrap_or("none")
+    ));
     match &status.last_import {
         Some(last) => {
             out.push_str(&format!(
@@ -85,13 +92,14 @@ pub fn render_status(status: &ArchiveStatus) -> String {
     out
 }
 
-pub fn render_search(hits: &[Hit], query: &str) -> String {
+pub fn render_search(hits: &[Hit], query: &str, mode: &str) -> String {
     if hits.is_empty() {
         return format!("No results for '{query}'.\n");
     }
     let mut out = format!(
-        "{} result(s) for '{query}' (keyword search)\n\n",
-        hits.len()
+        "{} result(s) for '{query}' ({} search)\n\n",
+        hits.len(),
+        mode
     );
     for (index, hit) in hits.iter().enumerate() {
         out.push_str(&format!(

@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::util::{ensure_private_dir, now_iso, restrict_permissions};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
@@ -162,6 +162,15 @@ CREATE TABLE IF NOT EXISTS attachments (
 CREATE INDEX IF NOT EXISTS attachments_file_id ON attachments(file_id);
 CREATE INDEX IF NOT EXISTS attachments_conversation ON attachments(conversation_id);
 
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    chunk_id    INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    model       TEXT NOT NULL,
+    dims        INTEGER NOT NULL,
+    vector      BLOB NOT NULL,
+    embedded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chunk_embeddings_model ON chunk_embeddings(model);
+
 -- Current context: explicit, human-managed facts. This is NOT derived from the
 -- archive and must never be wiped by a reindex or reimport. Provenance points
 -- back to conversation/message ids without a foreign key so reimports do not
@@ -204,6 +213,17 @@ CREATE TABLE IF NOT EXISTS current_context_events (
     at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS current_context_events_key ON current_context_events(key, at);
+"#;
+
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    chunk_id    INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    model       TEXT NOT NULL,
+    dims        INTEGER NOT NULL,
+    vector      BLOB NOT NULL,
+    embedded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chunk_embeddings_model ON chunk_embeddings(model);
 "#;
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -275,6 +295,25 @@ fn migrate(conn: &Connection) -> Result<()> {
                 return Err(err).context("apply schema");
             }
         }
+    } else if current < SCHEMA_VERSION {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<()> {
+            if current < 2 {
+                conn.execute_batch(SCHEMA_V2)?;
+            }
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [SCHEMA_VERSION.to_string()],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(err).context("migrate schema");
+            }
+        }
     }
     Ok(())
 }
@@ -308,7 +347,7 @@ mod tests {
         let path = dir.path().join("archive.db");
         let conn = open(&path).unwrap();
         let version = get_meta(&conn, "schema_version").unwrap();
-        assert_eq!(version.as_deref(), Some("1"));
+        assert_eq!(version.as_deref(), Some("2"));
         drop(conn);
 
         let conn = open(&path).unwrap();

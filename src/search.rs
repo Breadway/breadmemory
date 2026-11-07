@@ -19,6 +19,10 @@ pub struct Hit {
     pub chunk_index: i64,
     pub text: String,
     pub score: f64,
+    pub keyword_rank: Option<usize>,
+    pub semantic_rank: Option<usize>,
+    pub semantic_score: Option<f32>,
+    pub fused_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,6 +115,7 @@ pub struct ArchiveStatus {
     pub text_chars: i64,
     pub context_active: i64,
     pub context_proposed: i64,
+    pub embedding: crate::embedding::EmbeddingStatus,
     pub last_import: Option<LastImport>,
 }
 
@@ -419,6 +424,10 @@ pub fn search_keyword(conn: &Connection, query: &str, options: &SearchOptions) -
                 chunk_index: row.get(9)?,
                 text: row.get(10)?,
                 score: -row.get::<_, f64>(11)?,
+                keyword_rank: None,
+                semantic_rank: None,
+                semantic_score: None,
+                fused_score: None,
             })
         },
     )?;
@@ -443,7 +452,207 @@ pub fn search_keyword(conn: &Connection, query: &str, options: &SearchOptions) -
             }
         }
     }
+    for (index, hit) in hits.iter_mut().enumerate() {
+        hit.keyword_rank = Some(index + 1);
+    }
     Ok(hits)
+}
+
+/// Exact cosine search over stored chunk embeddings. This is a brute-force
+/// index, which is fast enough at tens of thousands of chunks and avoids a
+/// loadable database extension. Vectors are L2-normalised, so dot product is
+/// cosine similarity.
+pub fn search_semantic(
+    conn: &Connection,
+    query_vector: &[f32],
+    model: &str,
+    options: &SearchOptions,
+) -> Result<Vec<Hit>> {
+    let limit = options.limit.clamp(1, 50);
+    let fetch = (limit * 6).clamp(limit, 300);
+
+    let mut scored: Vec<(f32, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT e.chunk_id, e.vector
+             FROM chunk_embeddings e
+             JOIN chunks c ON c.id = e.chunk_id
+             JOIN conversations cv ON cv.id = c.conversation_id
+             LEFT JOIN messages m
+                    ON m.conversation_id = c.conversation_id AND m.node_id = c.node_id
+             WHERE e.model = :model
+               AND (:include_hidden = 1 OR c.hidden = 0)
+               AND (:role IS NULL OR m.author_role = :role)
+               AND (:after IS NULL OR cv.create_time >= :after)
+               AND (:before IS NULL OR cv.create_time <= :before)
+               AND (:conv IS NULL OR c.conversation_id = :conv)
+               AND (:exclude_conv IS NULL OR c.conversation_id != :exclude_conv)",
+        )?;
+        let rows = stmt.query_map(
+            named_params! {
+                ":model": model,
+                ":include_hidden": options.include_hidden as i64,
+                ":role": options.role,
+                ":after": options.after,
+                ":before": options.before,
+                ":conv": options.conversation_id,
+                ":exclude_conv": options.exclude_conversation_id,
+            },
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?;
+        let mut values = Vec::new();
+        for row in rows {
+            let (chunk_id, bytes) = row?;
+            let vector = crate::embedding::decode_vector(&bytes);
+            if vector.len() != query_vector.len() {
+                continue;
+            }
+            values.push((crate::embedding::dot(query_vector, &vector), chunk_id));
+        }
+        values.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        values.truncate(fetch);
+        values
+    };
+    if scored.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.conversation_id, cv.title, cv.create_time, c.node_id, c.message_id,
+                COALESCE(m.author_role, 'unknown'), m.create_time, m.is_on_active_branch,
+                c.chunk_index, c.text
+         FROM chunks c
+         JOIN conversations cv ON cv.id = c.conversation_id
+         LEFT JOIN messages m
+                ON m.conversation_id = c.conversation_id AND m.node_id = c.node_id
+         WHERE c.id = ?1",
+    )?;
+
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut hits = Vec::new();
+    for (score, chunk_id) in scored.drain(..) {
+        let hit = stmt.query_row(params![chunk_id], |row| {
+            Ok(Hit {
+                chunk_id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                conversation_title: row.get(2)?,
+                conversation_created_at: row.get(3)?,
+                node_id: row.get(4)?,
+                message_id: row.get(5)?,
+                role: row.get(6)?,
+                message_created_at: row.get(7)?,
+                active_branch: row.get::<_, i64>(8)? != 0,
+                chunk_index: row.get(9)?,
+                text: row.get(10)?,
+                score: score as f64 * 100.0,
+                keyword_rank: None,
+                semantic_rank: None,
+                semantic_score: Some(score),
+                fused_score: None,
+            })
+        })?;
+        if seen.insert((hit.conversation_id.clone(), hit.node_id.clone())) {
+            hits.push(hit);
+            if hits.len() >= limit {
+                break;
+            }
+        }
+    }
+    for (index, hit) in hits.iter_mut().enumerate() {
+        hit.semantic_rank = Some(index + 1);
+    }
+    Ok(hits)
+}
+
+/// Reciprocal Rank Fusion over message-level keyword and semantic rankings.
+/// Each list contributes 1 / (k + rank); k=60 is the standard default.
+pub fn rrf_fuse(keyword: Vec<Hit>, semantic: Vec<Hit>, limit: usize, k: f64) -> Vec<Hit> {
+    let mut merged: HashMap<(String, String), Hit> = HashMap::new();
+    let k = if k > 0.0 { k } else { 60.0 };
+
+    for (index, mut hit) in keyword.into_iter().enumerate() {
+        let rank = index + 1;
+        hit.keyword_rank = Some(rank);
+        hit.semantic_rank = None;
+        let contribution = 1.0 / (k + rank as f64);
+        hit.fused_score = Some(contribution);
+        merged.insert((hit.conversation_id.clone(), hit.node_id.clone()), hit);
+    }
+
+    for (index, hit) in semantic.into_iter().enumerate() {
+        let rank = index + 1;
+        let key = (hit.conversation_id.clone(), hit.node_id.clone());
+        match merged.get_mut(&key) {
+            Some(existing) => {
+                existing.semantic_rank = Some(rank);
+                existing.semantic_score = hit.semantic_score;
+                existing.fused_score =
+                    Some(existing.fused_score.unwrap_or(0.0) + 1.0 / (k + rank as f64));
+            }
+            None => {
+                let mut hit = hit;
+                hit.semantic_rank = Some(rank);
+                hit.fused_score = Some(1.0 / (k + rank as f64));
+                merged.insert(key, hit);
+            }
+        }
+    }
+
+    let mut hits: Vec<Hit> = merged.into_values().collect();
+    hits.sort_by(|a, b| {
+        b.fused_score
+            .unwrap_or(0.0)
+            .partial_cmp(&a.fused_score.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(limit);
+    for hit in &mut hits {
+        hit.score = hit.fused_score.unwrap_or(0.0) * 1000.0;
+    }
+    hits
+}
+
+/// Hybrid retrieval with RRF, falling back cleanly if either lane has no hits.
+pub fn search_hybrid(
+    conn: &Connection,
+    embedder: &mut crate::embedding::Embedder,
+    query: &str,
+    options: &SearchOptions,
+    keyword_only: bool,
+    semantic_only: bool,
+    rrf_k: f64,
+) -> Result<(Vec<Hit>, &'static str)> {
+    let keyword = if semantic_only {
+        Vec::new()
+    } else {
+        search_keyword(conn, query, options)?
+    };
+    let semantic = if keyword_only {
+        Vec::new()
+    } else {
+        let vectors = embedder.embed(&[query])?;
+        let Some(vector) = vectors.first() else {
+            return Ok((keyword, "keyword"));
+        };
+        search_semantic(conn, vector, crate::embedding::MODEL_ID, options)?
+    };
+
+    let mode = if keyword.is_empty() && semantic.is_empty() {
+        "keyword"
+    } else if keyword.is_empty() {
+        "semantic"
+    } else if semantic.is_empty() {
+        "keyword"
+    } else {
+        "hybrid"
+    };
+    let hits = if keyword_only || semantic.is_empty() {
+        keyword
+    } else if semantic_only || keyword.is_empty() {
+        semantic
+    } else {
+        rrf_fuse(keyword, semantic, options.limit.clamp(1, 50), rrf_k)
+    };
+    Ok((hits, mode))
 }
 
 pub fn resolve_conversation_id(conn: &Connection, needle: &str) -> Result<String> {
@@ -979,6 +1188,7 @@ pub fn archive_status(conn: &Connection, db_path: &str) -> Result<ArchiveStatus>
     let db_bytes = std::fs::metadata(db_path)
         .map(|meta| meta.len())
         .unwrap_or(0);
+    let embedding = crate::embedding::status(conn)?;
 
     Ok(ArchiveStatus {
         schema_version,
@@ -993,6 +1203,7 @@ pub fn archive_status(conn: &Connection, db_path: &str) -> Result<ArchiveStatus>
         text_chars,
         context_active,
         context_proposed,
+        embedding,
         last_import,
     })
 }
@@ -1016,6 +1227,10 @@ pub fn hit_to_json(hit: &Hit) -> serde_json::Value {
         "on_active_branch": hit.active_branch,
         "chunk_index": hit.chunk_index,
         "score": hit.score,
+        "keyword_rank": hit.keyword_rank,
+        "semantic_rank": hit.semantic_rank,
+        "semantic_score": hit.semantic_score,
+        "fused_score": hit.fused_score,
         "text": hit.text,
     })
 }
@@ -1124,6 +1339,14 @@ pub fn status_json(status: &ArchiveStatus) -> serde_json::Value {
             "active": status.context_active,
             "proposed": status.context_proposed,
         },
+        "embeddings": {
+            "model": status.embedding.model,
+            "dims": status.embedding.dims,
+            "embedded_chunks": status.embedding.embedded_chunks,
+            "total_chunks": status.embedding.total_chunks,
+            "coverage": status.embedding.coverage(),
+            "ready": status.embedding.ready,
+        },
         "last_import": status.last_import.as_ref().map(|last| serde_json::json!({
             "source_path": last.source_path,
             "finished_at": last.finished_at,
@@ -1164,5 +1387,44 @@ mod tests {
         assert!(terms.contains(&"zfs".to_string()));
         assert!(terms.contains(&"tank".to_string()));
         assert!(!terms.contains(&"the".to_string()));
+    }
+
+    fn test_hit(conversation: &str, node: &str, text: &str) -> Hit {
+        Hit {
+            chunk_id: 1,
+            conversation_id: conversation.to_string(),
+            conversation_title: conversation.to_string(),
+            conversation_created_at: None,
+            node_id: node.to_string(),
+            message_id: Some(node.to_string()),
+            role: "user".to_string(),
+            message_created_at: None,
+            active_branch: true,
+            chunk_index: 0,
+            text: text.to_string(),
+            score: 0.0,
+            keyword_rank: None,
+            semantic_rank: None,
+            semantic_score: None,
+            fused_score: None,
+        }
+    }
+
+    #[test]
+    fn rrf_rewards_results_present_in_both_lists() {
+        let keyword = vec![
+            test_hit("a", "a1", "keyword only"),
+            test_hit("b", "b1", "both"),
+        ];
+        let semantic = vec![
+            test_hit("b", "b1", "both"),
+            test_hit("c", "c1", "semantic only"),
+        ];
+        let fused = rrf_fuse(keyword, semantic, 3, 60.0);
+        assert_eq!(fused[0].conversation_id, "b");
+        assert_eq!(fused[0].keyword_rank, Some(2));
+        assert_eq!(fused[0].semantic_rank, Some(1));
+        assert!(fused[0].fused_score.unwrap() > fused[1].fused_score.unwrap());
+        assert_eq!(fused.len(), 3);
     }
 }

@@ -747,6 +747,12 @@ pub fn import_odysseus(
     let now = now_iso();
 
     for item in items {
+        if item.get("source").and_then(Value::as_str) == Some("breadmemory") {
+            // Projection entries written by `sync-odysseus`; importing them
+            // back would duplicate breadmemory facts.
+            report.skipped += 1;
+            continue;
+        }
         let text = item
             .get("text")
             .and_then(Value::as_str)
@@ -884,11 +890,209 @@ pub fn export_odysseus(conn: &Connection) -> Result<Value> {
                     "source_kind": fact.source_kind,
                     "source_conversation_id": fact.source_conversation_id,
                     "source_message_id": fact.source_message_id,
+                    "projected_text": fact.value
                 }
             })
         })
         .collect();
     Ok(Value::Array(items))
+}
+
+#[derive(Debug, Default)]
+pub struct OdysseusSyncReport {
+    pub source: String,
+    pub imported: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub native_edits: usize,
+    pub projected: usize,
+    pub native_kept: usize,
+    pub errors: Vec<String>,
+}
+
+/// Two-way sync with Odysseus' memory store.
+///
+/// 1. Edits made to breadmemory projections in Odysseus are detected by
+///    comparing the entry text with the `projected_text` breadmemory last
+///    wrote, and are imported back into current context.
+/// 2. New native memories (source != "breadmemory") are imported, keyed by
+///    their Odysseus id.
+/// 3. Active current-context facts are projected back into `memory.json` as
+///    native-compatible entries, so Odysseus' existing per-turn injection keeps
+///    working without upstream code changes.
+///
+/// Imported native rows keep their original id, so the projection replaces the
+/// native copy instead of duplicating it. Retracting a fact removes its
+/// projection on the next sync. If both sides change between syncs, the
+/// Odysseus-side edit wins and is projected back.
+pub fn sync_odysseus(
+    conn: &mut Connection,
+    path: &std::path::Path,
+    owner: &str,
+    actor: &str,
+) -> Result<OdysseusSyncReport> {
+    let memory_file = if path.is_dir() {
+        path.join("memory.json")
+    } else {
+        path.to_path_buf()
+    };
+    let bytes =
+        std::fs::read(&memory_file).with_context(|| format!("read {}", memory_file.display()))?;
+    let document: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {}", memory_file.display()))?;
+    let mut entries: Vec<Value> = match document {
+        Value::Array(items) => items,
+        Value::Object(map) => map
+            .get("memories")
+            .and_then(Value::as_array)
+            .cloned()
+            .context("memory.json object has no 'memories' array")?,
+        _ => bail!("memory.json is not an array or object"),
+    };
+
+    let native_edits = apply_projected_edits(conn, &entries, actor)?;
+    let imported = import_odysseus(conn, &memory_file, actor)?;
+    let mut report = OdysseusSyncReport {
+        source: imported.source,
+        imported: imported.imported,
+        updated: imported.updated,
+        skipped: imported.skipped,
+        native_edits,
+        errors: imported.errors,
+        ..Default::default()
+    };
+
+    let facts = list(conn, &["active"], None, None)?;
+    let mut by_id: std::collections::HashMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            entry
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| (id.to_string(), index))
+        })
+        .collect();
+    let mut projected_ids = std::collections::HashSet::new();
+
+    for fact in &facts {
+        let id = fact
+            .external_id
+            .clone()
+            .filter(|_| fact.external_system.as_deref() == Some("odysseus"))
+            .unwrap_or_else(|| {
+                format!("bm-{}", &crate::util::sha256_hex(fact.key.as_bytes())[..16])
+            });
+        let entry = json!({
+            "id": id.clone(),
+            "text": fact.value,
+            "category": odysseus_category(&fact.category),
+            "source": "breadmemory",
+            "owner": if owner.trim().is_empty() { Value::Null } else { Value::String(owner.to_string()) },
+            "session_id": Value::Null,
+            "timestamp": unix_from_iso(&fact.updated_at),
+            "pinned": fact.pinned,
+            "breadmemory": {
+                "key": fact.key,
+                "confidence": fact.confidence,
+                "source_kind": fact.source_kind,
+                "source_conversation_id": fact.source_conversation_id,
+                "source_message_id": fact.source_message_id,
+                "projected_text": fact.value
+            }
+        });
+        projected_ids.insert(id.clone());
+        if let Some(index) = by_id.get(&id).copied() {
+            entries[index] = entry;
+        } else {
+            by_id.insert(id, entries.len());
+            entries.push(entry);
+        }
+    }
+
+    entries.retain(|entry| {
+        if entry.get("source").and_then(Value::as_str) != Some("breadmemory") {
+            return true;
+        }
+        entry
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| projected_ids.contains(id))
+            .unwrap_or(false)
+    });
+
+    report.projected = facts.len();
+    report.native_kept = entries
+        .iter()
+        .filter(|entry| entry.get("source").and_then(Value::as_str) != Some("breadmemory"))
+        .count();
+
+    let text = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&Value::Array(entries))?
+    );
+    let temp = memory_file.with_extension("json.breadmemory.tmp");
+    std::fs::write(&temp, text).with_context(|| format!("write {}", temp.display()))?;
+    std::fs::rename(&temp, &memory_file)
+        .with_context(|| format!("replace {}", memory_file.display()))?;
+    Ok(report)
+}
+
+fn apply_projected_edits(conn: &Connection, entries: &[Value], actor: &str) -> Result<usize> {
+    let now = now_iso();
+    let mut applied = 0usize;
+    for entry in entries {
+        if entry.get("source").and_then(Value::as_str) != Some("breadmemory") {
+            continue;
+        }
+        let Some(breadmemory) = entry.get("breadmemory") else {
+            continue;
+        };
+        let Some(key) = breadmemory.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(projected) = breadmemory.get("projected_text").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(text) = entry
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        if text == projected {
+            continue;
+        }
+        let Some(fact) = get_active(conn, key)? else {
+            continue;
+        };
+        if fact.value == text {
+            continue;
+        }
+        let pinned = entry
+            .get("pinned")
+            .and_then(Value::as_bool)
+            .unwrap_or(fact.pinned);
+        conn.execute(
+            "UPDATE current_context SET value = ?1, pinned = ?2, updated_at = ?3 WHERE id = ?4",
+            params![text, pinned as i64, now, fact.id],
+        )?;
+        record_event(
+            conn,
+            fact.id,
+            &fact.key,
+            "synced",
+            Some(&fact.value),
+            Some(text),
+            actor,
+            Some("edited in Odysseus memory"),
+            &now,
+        )?;
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 fn odysseus_note(item: &Value) -> Option<String> {
@@ -1172,5 +1376,104 @@ mod tests {
 
         let exported = export_odysseus(&conn).unwrap();
         assert_eq!(exported.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn odysseus_sync_imports_and_projects_without_duplicates() {
+        let (dir, mut conn) = fresh();
+        let memory_file = dir.path().join("memory.json");
+        std::fs::write(
+            &memory_file,
+            r#"[{"id":"native-1","text":"Riley lives in Sydney","category":"identity","owner":"breadway","timestamp":1700000000}]"#,
+        )
+        .unwrap();
+
+        let report = sync_odysseus(&mut conn, &memory_file, "breadway", "tester").unwrap();
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.projected, 1);
+        assert_eq!(report.native_kept, 0);
+        let entries: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&memory_file).unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], "native-1");
+        assert_eq!(entries[0]["source"], "breadmemory");
+        assert_eq!(entries[0]["owner"], "breadway");
+
+        // Editing the projection in Odysseus is imported back.
+        let imported_key = list(&conn, &[], None, None)
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.value.contains("Sydney"))
+            .unwrap()
+            .key;
+        let mut edited = entries.clone();
+        edited[0]["text"] = serde_json::json!("Riley lives in Sydney, Australia");
+        edited[0]["pinned"] = serde_json::json!(true);
+        std::fs::write(&memory_file, serde_json::to_vec(&edited).unwrap()).unwrap();
+        let report = sync_odysseus(&mut conn, &memory_file, "breadway", "tester").unwrap();
+        assert_eq!(report.native_edits, 1);
+        let fact = get_active(&conn, &imported_key).unwrap().unwrap();
+        assert_eq!(fact.value, "Riley lives in Sydney, Australia");
+        assert!(fact.pinned);
+
+        // A breadmemory edit is projected outward and is not treated as a
+        // native edit on the following pass.
+        let mut update = SetRequest::manual(&imported_key, "Riley lives in Sydney", "tester");
+        update.category = fact.category.clone();
+        update.pinned = true;
+        set_fact(&mut conn, &update).unwrap();
+        let report = sync_odysseus(&mut conn, &memory_file, "breadway", "tester").unwrap();
+        assert_eq!(report.native_edits, 0);
+        let entries: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&memory_file).unwrap()).unwrap();
+        assert_eq!(entries[0]["text"], "Riley lives in Sydney");
+
+        let mut request = SetRequest::manual("project.breadmemory", "Uses breadmemory", "tester");
+        request.category = "project".to_string();
+        request.pinned = true;
+        set_fact(&mut conn, &request).unwrap();
+
+        let report = sync_odysseus(&mut conn, &memory_file, "breadway", "tester").unwrap();
+        assert_eq!(report.imported, 0);
+        assert_eq!(report.projected, 2);
+        let entries: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&memory_file).unwrap()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry["text"] == "Uses breadmemory" && entry["pinned"] == true));
+
+        // A new native memory is imported and projected with its original id.
+        let mut native: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&memory_file).unwrap()).unwrap();
+        native.push(serde_json::json!({
+            "id": "native-2", "text": "Prefers Rust", "category": "preference",
+            "owner": "breadway", "timestamp": 1700000200
+        }));
+        std::fs::write(&memory_file, serde_json::to_vec(&native).unwrap()).unwrap();
+        let report = sync_odysseus(&mut conn, &memory_file, "breadway", "tester").unwrap();
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.projected, 3);
+        let entries: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&memory_file).unwrap()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["id"] == "native-2")
+                .count(),
+            1
+        );
+
+        // Retracting a fact removes its projection on the next sync.
+        retract(&mut conn, "project.breadmemory", "tester", Some("test")).unwrap();
+        let report = sync_odysseus(&mut conn, &memory_file, "breadway", "tester").unwrap();
+        assert_eq!(report.projected, 2);
+        let entries: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&memory_file).unwrap()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(!entries
+            .iter()
+            .any(|entry| entry["breadmemory"]["key"] == "project.breadmemory"));
     }
 }

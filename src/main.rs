@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use breadmemory::context::SetRequest;
 use breadmemory::importer::ImportOptions;
 use breadmemory::util::{parse_time_bound, truncate_chars};
-use breadmemory::{context, db, importer, mcp, render, search};
+use breadmemory::{context, db, embedding, eval, importer, mcp, render, search};
 
 #[derive(Parser)]
 #[command(
@@ -67,7 +67,7 @@ enum Command {
         json: bool,
     },
 
-    /// Keyword search the archive
+    /// Keyword or hybrid search the archive
     Search {
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
@@ -81,6 +81,10 @@ enum Command {
         before: Option<String>,
         #[arg(long)]
         include_hidden: bool,
+        #[arg(long, help = "Skip the semantic lane even when embeddings exist")]
+        keyword_only: bool,
+        #[arg(long, default_value_t = 60.0)]
+        rrf_k: f64,
         #[arg(long)]
         json: bool,
     },
@@ -142,6 +146,29 @@ enum Command {
     /// Rebuild only the FTS index from stored chunks
     RebuildFts,
 
+    /// Generate local embeddings for chunks that do not have them
+    Embed {
+        #[arg(long, default_value_t = 32)]
+        batch_size: usize,
+        #[arg(long, help = "Embed at most this many chunks")]
+        limit: Option<usize>,
+        #[arg(long, help = "Delete existing vectors and embed every chunk again")]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run the retrieval evaluation harness
+    Eval {
+        cases: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        k: usize,
+        #[arg(long, help = "Also evaluate hybrid retrieval when embeddings exist")]
+        compare: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run the MCP server over stdio
     Serve,
 }
@@ -175,6 +202,8 @@ enum ContextCommand {
         category: String,
         #[arg(long, default_value = "stated")]
         confidence: String,
+        #[arg(long, default_value = "active", value_parser = ["active", "proposed"])]
+        status: String,
         #[arg(long, help = "Always inject this fact during recall")]
         pinned: bool,
         #[arg(long)]
@@ -253,6 +282,18 @@ enum ContextCommand {
     ExportOdysseus {
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+
+    /// Import new Odysseus memories, then project active facts back into memory.json
+    #[command(name = "sync-odysseus")]
+    SyncOdysseus {
+        path: PathBuf,
+        #[arg(long, env = "BREADMEMORY_ODYSSEUS_OWNER")]
+        owner: Option<String>,
+        #[arg(long, env = "BREADMEMORY_ACTOR", default_value = "cli")]
+        actor: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -341,6 +382,8 @@ fn run() -> Result<()> {
             after,
             before,
             include_hidden,
+            keyword_only,
+            rrf_k,
             json,
         } => {
             let conn = db::open(&db_path)?;
@@ -359,12 +402,38 @@ fn run() -> Result<()> {
                 include_hidden,
                 ..Default::default()
             };
-            let hits = search::search_keyword(&conn, &query, &options)?;
+            let embedding_status = embedding::status(&conn)?;
+            let mut mode = "keyword";
+            let hits = if keyword_only || !embedding_status.ready {
+                search::search_keyword(&conn, &query, &options)?
+            } else {
+                match embedding::Embedder::load(&embedding::default_model_dir(&home)) {
+                    Ok(mut embedder) => {
+                        let (hits, selected_mode) = search::search_hybrid(
+                            &conn,
+                            &mut embedder,
+                            &query,
+                            &options,
+                            false,
+                            false,
+                            rrf_k,
+                        )?;
+                        mode = selected_mode;
+                        hits
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "breadmemory: semantic search unavailable ({err:#}); using keyword search"
+                        );
+                        search::search_keyword(&conn, &query, &options)?
+                    }
+                }
+            };
             if json {
                 let values: Vec<Value> = hits.iter().map(search::hit_to_json).collect();
-                print_json(&Value::Array(values))?;
+                print_json(&json!({ "mode": mode, "results": values }))?;
             } else {
-                print!("{}", render::render_search(&hits, &query));
+                print!("{}", render::render_search(&hits, &query, mode));
             }
             Ok(())
         }
@@ -486,6 +555,118 @@ fn run() -> Result<()> {
             Ok(())
         }
 
+        Command::Embed {
+            batch_size,
+            limit,
+            all,
+            json,
+        } => {
+            let mut conn = db::open(&db_path)?;
+            if all {
+                embedding::clear(&conn)?;
+            }
+            let model_dir = embedding::default_model_dir(&home);
+            let mut embedder = embedding::Embedder::load(&model_dir)?;
+            let started = std::time::Instant::now();
+            let count = embedding::embed_pending(
+                &mut conn,
+                &mut embedder,
+                embedding::MODEL_ID,
+                batch_size,
+                limit,
+                true,
+            )?;
+            let status = embedding::status(&conn)?;
+            if json {
+                print_json(&json!({
+                    "embedded": count,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "model": status.model,
+                    "dims": status.dims,
+                    "embedded_chunks": status.embedded_chunks,
+                    "total_chunks": status.total_chunks,
+                    "coverage": status.coverage(),
+                }))?;
+            } else {
+                println!(
+                    "Embedded {count} chunks in {:.1}s ({}/{} chunks, {:.1}% coverage).",
+                    started.elapsed().as_secs_f64(),
+                    status.embedded_chunks,
+                    status.total_chunks,
+                    status.coverage() * 100.0
+                );
+            }
+            Ok(())
+        }
+
+        Command::Eval {
+            cases,
+            k,
+            compare,
+            json,
+        } => {
+            let conn = db::open(&db_path)?;
+            let cases = eval::load_cases(&cases)?;
+            let k = k.clamp(1, 50);
+            let options = search::SearchOptions {
+                limit: k,
+                ..Default::default()
+            };
+            let (keyword_outcomes, keyword_summary) = evaluate_mode(
+                &cases,
+                k,
+                |query| search::search_keyword(&conn, query, &options),
+                "keyword",
+            )?;
+            let embedding_status = embedding::status(&conn)?;
+            let mut hybrid_result = None;
+            if compare && embedding_status.ready {
+                let model_dir = embedding::default_model_dir(&home);
+                let mut embedder = embedding::Embedder::load(&model_dir)?;
+                hybrid_result = Some(evaluate_mode(
+                    &cases,
+                    k,
+                    |query| {
+                        search::search_hybrid(
+                            &conn,
+                            &mut embedder,
+                            query,
+                            &options,
+                            false,
+                            false,
+                            60.0,
+                        )
+                        .map(|(hits, _)| hits)
+                    },
+                    "hybrid",
+                )?);
+            }
+
+            if json {
+                let mut document = json!({
+                    "cases": cases.len(),
+                    "k": k,
+                    "keyword": summary_json(&keyword_summary),
+                    "keyword_details": keyword_outcomes.iter().map(outcome_json).collect::<Vec<_>>(),
+                });
+                if let Some((outcomes, summary)) = &hybrid_result {
+                    document["hybrid"] = summary_json(summary);
+                    document["hybrid_details"] =
+                        Value::Array(outcomes.iter().map(outcome_json).collect());
+                }
+                print_json(&document)?;
+            } else {
+                print_eval_summary(&keyword_outcomes, &keyword_summary);
+                if let Some((outcomes, summary)) = &hybrid_result {
+                    println!();
+                    print_eval_summary(outcomes, summary);
+                } else if compare {
+                    println!("\nHybrid evaluation skipped: embeddings are not ready.");
+                }
+            }
+            Ok(())
+        }
+
         Command::Serve => mcp::serve(&db_path),
     }
 }
@@ -532,6 +713,7 @@ fn context_command(db_path: &std::path::Path, command: ContextCommand) -> Result
             value,
             category,
             confidence,
+            status,
             pinned,
             conversation,
             message,
@@ -543,6 +725,7 @@ fn context_command(db_path: &std::path::Path, command: ContextCommand) -> Result
             let mut request = SetRequest::manual(&key, &value, &actor);
             request.category = category;
             request.confidence = confidence;
+            request.status = status;
             request.pinned = pinned;
             request.note = note;
             let mut quote = quote;
@@ -691,6 +874,43 @@ fn context_command(db_path: &std::path::Path, command: ContextCommand) -> Result
             let document = context::export_odysseus(&conn)?;
             write_json(&document, out.as_deref())
         }
+
+        ContextCommand::SyncOdysseus {
+            path,
+            owner,
+            actor,
+            json,
+        } => {
+            let owner = owner.unwrap_or_default();
+            let report = context::sync_odysseus(&mut conn, &path, &owner, &actor)?;
+            if json {
+                print_json(&json!({
+                    "source": report.source,
+                    "imported": report.imported,
+                    "updated": report.updated,
+                    "skipped": report.skipped,
+                    "native_edits": report.native_edits,
+                    "projected": report.projected,
+                    "native_kept": report.native_kept,
+                    "errors": report.errors,
+                }))?;
+            } else {
+                println!("Synced {}", report.source);
+                println!(
+                    "  imported {} new, {} updated, {} skipped, {} native edit(s), {} projected, {} native kept",
+                    report.imported,
+                    report.updated,
+                    report.skipped,
+                    report.native_edits,
+                    report.projected,
+                    report.native_kept
+                );
+                for error in &report.errors {
+                    eprintln!("warning: {error}");
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -719,4 +939,79 @@ fn default_home() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".local/share/breadmemory")
+}
+
+fn evaluate_mode(
+    cases: &[eval::EvalCase],
+    k: usize,
+    mut run: impl FnMut(&str) -> Result<Vec<search::Hit>>,
+    label: &str,
+) -> Result<(Vec<eval::CaseOutcome>, eval::EvalSummary)> {
+    let mut outcomes = Vec::with_capacity(cases.len());
+    let mut ranks = Vec::with_capacity(cases.len());
+    let mut latencies = Vec::with_capacity(cases.len());
+    for case in cases {
+        let started = std::time::Instant::now();
+        let hits = run(&case.query)?;
+        let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let rank = eval::first_match(&hits, case, k);
+        ranks.push(rank);
+        latencies.push(latency_ms);
+        outcomes.push(eval::CaseOutcome {
+            query: case.query.clone(),
+            rank,
+            latency_ms,
+            top_title: hits.first().map(|hit| hit.conversation_title.clone()),
+        });
+    }
+    let summary = eval::summarize(label, k, &ranks, &latencies);
+    Ok((outcomes, summary))
+}
+
+fn summary_json(summary: &eval::EvalSummary) -> Value {
+    json!({
+        "label": summary.label,
+        "cases": summary.cases,
+        "k": summary.k,
+        "hits": summary.hits,
+        "recall_at_k": summary.recall_at_k,
+        "mrr": summary.mrr,
+        "avg_latency_ms": summary.avg_latency_ms,
+    })
+}
+
+fn outcome_json(outcome: &eval::CaseOutcome) -> Value {
+    json!({
+        "query": outcome.query,
+        "rank": outcome.rank,
+        "latency_ms": outcome.latency_ms,
+        "top_title": outcome.top_title,
+    })
+}
+
+fn print_eval_summary(outcomes: &[eval::CaseOutcome], summary: &eval::EvalSummary) {
+    for outcome in outcomes {
+        match outcome.rank {
+            Some(rank) => println!(
+                "  hit  #{rank}  {:.0} ms  {}",
+                outcome.latency_ms, outcome.query
+            ),
+            None => println!(
+                "  MISS      {:.0} ms  {}  (top: {})",
+                outcome.latency_ms,
+                outcome.query,
+                outcome.top_title.as_deref().unwrap_or("none")
+            ),
+        }
+    }
+    println!(
+        "{}: {}/{} hits, recall@{} {:.3}, MRR {:.3}, {:.0} ms/query",
+        summary.label,
+        summary.hits,
+        summary.cases,
+        summary.k,
+        summary.recall_at_k,
+        summary.mrr,
+        summary.avg_latency_ms
+    );
 }

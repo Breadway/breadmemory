@@ -5,6 +5,8 @@
 pub mod chunk;
 pub mod context;
 pub mod db;
+pub mod embedding;
+pub mod eval;
 pub mod export;
 pub mod importer;
 pub mod mcp;

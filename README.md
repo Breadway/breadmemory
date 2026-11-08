@@ -234,12 +234,16 @@ breadmemory context accept homelab.zfs.arc_max_note
 Set `BREADMEMORY_MCP_WRITES=direct` only in a trusted setup where the assistant
 is allowed to write current facts without review.
 
-Export and restore:
+Export, restore and merge:
 
 ```sh
 breadmemory context export --out context.json
 breadmemory context import context.json --replace
+breadmemory context import facts.json --merge
 ```
+
+`--merge` upserts facts by key without deleting existing rows, which is how a
+ChatGPT memory export or a curated profile can be added alongside live memory.
 
 Two-way Odysseus sync:
 

@@ -81,16 +81,22 @@ The call is skipped in agent mode and incognito chats.
 
 ## 4. Agent mode tool selection
 
-Agent mode calls tools through function schemas, but its tool-RAG selection can
-drop unfamiliar MCP tools. Two small Odysseus-side hints keep breadmemory in
-reach:
+Agent mode calls tools through function schemas, and its turn-contract
+families are an authorisation boundary. Breadmemory needs an explicit family:
 
-- `src/tool_index.py`: add `mcp__breadmemory__get_current_context` to
-  `ALWAYS_AVAILABLE`, and map archive/memory phrases to all six breadmemory
-  tools in `_KEYWORD_HINTS`.
+- `src/turn_contract.py`: add a `breadmemory` family containing the six
+  `mcp__8a8c0ff2e107__*` schemas, and route archive/memory phrases to it before
+  generic web/search heuristics. The family is gated by the request classifier,
+  not offered on every turn.
+- `src/tool_index.py`: add `get_current_context` to `ALWAYS_AVAILABLE`, and map
+  archive/memory phrases to the bare breadmemory tool names in
+  `_KEYWORD_HINTS`.
 - `src/agent_loop.py`: add `breadmemory`, `chatgpt archive`, `past chats`, and
-  `chat history` to `_MCP_KEYWORDS` for local models.
+  `chat history` to `_MCP_KEYWORDS` for local models, and match MCP schemas by
+  bare tool name as well as the qualified server-ID name.
 
 With those, an agent-mode message such as "search for Addi in breadmemory"
 selects `mcp__breadmemory__search_conversations` and the other breadmemory
-tools instead of reporting that no such tool exists.
+tools instead of reporting that no such tool exists. Verified with
+`requested_capabilities()` and `resolve_turn_contract()` inside the running
+container: the query resolves to family `breadmemory` and offers all six tools.

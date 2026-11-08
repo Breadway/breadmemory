@@ -144,7 +144,7 @@ fn tool_search(
     args: &Value,
 ) -> Result<Value> {
     let query = required_str(args, "query")?;
-    let limit = int_arg(args, "limit", 5, 1, 12);
+    let limit = int_arg(args, "limit", 8, 1, 12);
     let context_messages = int_arg(args, "context", 0, 0, 3);
     let include_hidden = bool_arg(args, "include_hidden", false);
     let options = SearchOptions {
@@ -546,7 +546,7 @@ fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Keywords. Wrap a phrase in double quotes for an exact match." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 12, "default": 5 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 12, "default": 8 },
                     "mode": { "type": "string", "enum": ["auto", "keyword", "hybrid", "semantic"], "default": "auto", "description": "auto uses hybrid when embeddings exist, otherwise keyword." },
                     "rrf_k": { "type": "number", "minimum": 1, "maximum": 1000, "default": 60, "description": "Reciprocal Rank Fusion constant." },
                     "role": { "type": "string", "enum": ["user", "assistant", "tool", "system"], "description": "Only return messages from this author role." },

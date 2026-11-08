@@ -144,8 +144,8 @@ fn tool_search(
     args: &Value,
 ) -> Result<Value> {
     let query = required_str(args, "query")?;
-    let limit = int_arg(args, "limit", 8, 1, 50);
-    let context_messages = int_arg(args, "context", 1, 0, 3);
+    let limit = int_arg(args, "limit", 8, 1, 12);
+    let context_messages = int_arg(args, "context", 0, 0, 3);
     let include_hidden = bool_arg(args, "include_hidden", false);
     let options = SearchOptions {
         limit,
@@ -200,6 +200,10 @@ fn tool_search(
     let mut results = Vec::new();
     for hit in &hits {
         let mut value = search::hit_to_json(hit);
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            let (clipped, _) = truncate_chars(text, 700);
+            value["text"] = Value::String(clipped);
+        }
         if context_messages > 0 {
             if let Ok(window) = search::get_context(
                 conn,
@@ -542,14 +546,14 @@ fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Keywords. Wrap a phrase in double quotes for an exact match." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 12, "default": 8 },
                     "mode": { "type": "string", "enum": ["auto", "keyword", "hybrid", "semantic"], "default": "auto", "description": "auto uses hybrid when embeddings exist, otherwise keyword." },
                     "rrf_k": { "type": "number", "minimum": 1, "maximum": 1000, "default": 60, "description": "Reciprocal Rank Fusion constant." },
                     "role": { "type": "string", "enum": ["user", "assistant", "tool", "system"], "description": "Only return messages from this author role." },
                     "after": { "type": "string", "description": "Only conversations created on or after this date (YYYY-MM-DD or RFC 3339)." },
                     "before": { "type": "string", "description": "Only conversations created on or before this date (YYYY-MM-DD or RFC 3339)." },
                     "include_hidden": { "type": "boolean", "default": false, "description": "Include system prompts, hidden context and reasoning traces." },
-                    "context": { "type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Surrounding messages to include for each result." }
+                    "context": { "type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "Surrounding messages to include for each result. Default 0 keeps results compact; use get_context for full text." }
                 },
                 "required": ["query"]
             }

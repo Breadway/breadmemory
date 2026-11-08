@@ -768,6 +768,120 @@ pub fn merge_json(conn: &mut Connection, document: &Value, actor: &str) -> Resul
     Ok(count)
 }
 
+/// Replace every fact from one source with the facts in a JSON document.
+/// Other sources are untouched. Used when a corrected memory or message dump
+/// supersedes the previous import.
+pub fn replace_source_json(
+    conn: &mut Connection,
+    document: &Value,
+    actor: &str,
+    source_kind: &str,
+) -> Result<usize> {
+    let source_kind = source_kind.trim();
+    if source_kind.is_empty() {
+        bail!("source kind is required");
+    }
+    let facts = document
+        .get("facts")
+        .and_then(Value::as_array)
+        .context("current context file has no 'facts' array")?;
+    let now = now_iso();
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM current_context WHERE source_kind = ?1",
+        params![source_kind],
+    )?;
+
+    let mut count = 0usize;
+    for fact in facts {
+        let key = fact.get("key").and_then(Value::as_str).unwrap_or_default();
+        let value = fact
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if key.trim().is_empty() || value.trim().is_empty() {
+            continue;
+        }
+        let mut request = SetRequest::manual(key, value, actor);
+        request.category = fact
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("general")
+            .to_string();
+        request.confidence = fact
+            .get("confidence")
+            .and_then(Value::as_str)
+            .unwrap_or("stated")
+            .to_string();
+        request.status = fact
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|status| matches!(*status, "active" | "proposed"))
+            .unwrap_or("active")
+            .to_string();
+        request.source_kind = source_kind.to_string();
+        request.source_conversation_id = fact
+            .get("source_conversation_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        request.source_message_id = fact
+            .get("source_message_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        request.source_quote = fact
+            .get("source_quote")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        request.note = fact.get("note").and_then(Value::as_str).map(str::to_string);
+        request.pinned = fact.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+        if request.validate().is_err() {
+            continue;
+        }
+
+        tx.execute(
+            "INSERT INTO current_context
+                (key, value, category, status, confidence, source_kind,
+                 source_conversation_id, source_message_id, source_quote, note, pinned,
+                 external_system, external_id, created_at, updated_at, verified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15)",
+            params![
+                request.key,
+                request.value,
+                request.category,
+                request.status,
+                request.confidence,
+                request.source_kind,
+                request.source_conversation_id,
+                request.source_message_id,
+                request.source_quote,
+                request.note,
+                request.pinned as i64,
+                fact.get("external_system").and_then(Value::as_str),
+                fact.get("external_id").and_then(Value::as_str),
+                fact.get("created_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&now),
+                fact.get("verified_at").and_then(Value::as_str),
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        record_event(
+            &tx,
+            id,
+            &request.key,
+            "imported",
+            None,
+            Some(&request.value),
+            actor,
+            Some("replaced source"),
+            &now,
+        )?;
+        count += 1;
+    }
+    tx.commit()?;
+    Ok(count)
+}
+
 #[derive(Debug, Default)]
 pub struct OdysseusImportReport {
     pub source: String,
@@ -1538,5 +1652,46 @@ mod tests {
         assert!(!entries
             .iter()
             .any(|entry| entry["breadmemory"]["key"] == "project.breadmemory"));
+    }
+
+    #[test]
+    fn replace_source_leaves_other_sources_alone() {
+        let (_dir, mut conn) = fresh();
+        let old = serde_json::json!({
+            "facts": [
+                {"key": "sms.one", "value": "old one", "category": "general",
+                 "status": "active", "confidence": "stated", "source_kind": "sms_export"},
+                {"key": "sms.two", "value": "old two", "category": "general",
+                 "status": "active", "confidence": "stated", "source_kind": "sms_export"}
+            ]
+        });
+        merge_json(&mut conn, &old, "tester").unwrap();
+        let mut manual = SetRequest::manual("identity.manual", "keep me", "tester");
+        manual.category = "identity".to_string();
+        set_fact(&mut conn, &manual).unwrap();
+
+        let new = serde_json::json!({
+            "facts": [
+                {"key": "sms.one", "value": "corrected one", "category": "general",
+                 "status": "active", "confidence": "stated"},
+                {"key": "sms.three", "value": "new three", "category": "general",
+                 "status": "active", "confidence": "stated"}
+            ]
+        });
+        let count = replace_source_json(&mut conn, &new, "tester", "sms_export").unwrap();
+        assert_eq!(count, 2);
+
+        let facts = list(&conn, &[], None, None).unwrap();
+        assert_eq!(facts.len(), 3);
+        assert!(facts.iter().any(|fact| fact.key == "identity.manual"));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.key == "sms.one" && fact.value == "corrected one"));
+        assert!(facts.iter().any(|fact| fact.key == "sms.three"));
+        assert!(!facts.iter().any(|fact| fact.key == "sms.two"));
+        assert!(facts
+            .iter()
+            .filter(|fact| fact.key.starts_with("sms."))
+            .all(|fact| fact.source_kind == "sms_export"));
     }
 }

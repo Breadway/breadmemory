@@ -240,10 +240,12 @@ Export, restore and merge:
 breadmemory context export --out context.json
 breadmemory context import context.json --replace
 breadmemory context import facts.json --merge
+breadmemory context import corrected.json --replace-source chatgpt_memory_export
 ```
 
-`--merge` upserts facts by key without deleting existing rows, which is how a
-ChatGPT memory export or a curated profile can be added alongside live memory.
+`--merge` upserts facts by key without deleting existing rows. `--replace-source`
+deletes only facts from the named source and imports the new set, leaving
+manually curated facts and other sources untouched.
 
 Two-way Odysseus sync:
 

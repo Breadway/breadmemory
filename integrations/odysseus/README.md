@@ -103,3 +103,41 @@ container: the query resolves to family `breadmemory` and offers all six tools.
 
 The family pins the current MCP server id (`8a8c0ff2e107`). If the breadmemory
 server row is deleted and re-added, update that id in `FAMILY_TOOLS`.
+
+## 5. Source-scoped replacement
+
+If a corrected memory or message dump supersedes an earlier import, replace
+only that source:
+
+```sh
+breadmemory context import corrected.json --replace-source chatgpt_memory_export
+breadmemory context sync-odysseus memory.json --owner breadway
+```
+
+The command deletes current-context rows whose `source_kind` matches, imports
+the new facts, and leaves manual or other-source facts untouched. The next sync
+updates `memory.json` and drops stale projections.
+
+## 6. Temporary Hermes audit MCP
+
+For a local audit, register a temporary OpenCode MCP server that runs the
+breadmemory binary over SSH against the live Hestia archive:
+
+```sh
+opencode mcp add breadmemory-audit --global -- \
+  ssh -o BatchMode=yes -o ConnectTimeout=10 breadway@192.168.1.102 \
+  env BREADMEMORY_DB=/mnt/media/llm/odysseus/data/breadmemory/archive.db \
+  BREADMEMORY_MODEL_DIR=/mnt/media/llm/odysseus/data/breadmemory/models/all-MiniLM-L6-v2 \
+  ORT_DYLIB_PATH=/home/breadway/host-mcp/breadmemory-bin/libonnxruntime.so \
+  BREADMEMORY_MCP_WRITES=direct BREADMEMORY_MCP_ACTOR=hermes-audit \
+  /home/breadway/host-mcp/breadmemory-bin/breadmemory serve
+```
+
+This exposes all seven tools, including `propose_current_context` as a direct
+write and `retract_current_context`. Remove it when the audit is done:
+
+```sh
+jq 'del(.mcp.servers["breadmemory-audit"])' ~/.config/opencode/opencode.json \
+  > /tmp/opencode.json && mv /tmp/opencode.json ~/.config/opencode/opencode.json
+```
+

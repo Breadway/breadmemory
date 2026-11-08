@@ -122,6 +122,7 @@ fn call_tool(
         "find_related" => tool_find_related(conn, embedder, model_dir, &args),
         "get_current_context" => tool_get_current_context(conn, &args),
         "propose_current_context" => tool_propose_current_context(conn, &args),
+        "retract_current_context" => tool_retract_current_context(conn, &args),
         other => Err(anyhow!("unknown tool: {other}")),
     };
 
@@ -474,6 +475,26 @@ fn tool_propose_current_context(conn: &mut Connection, args: &Value) -> Result<V
     }))
 }
 
+fn tool_retract_current_context(conn: &mut Connection, args: &Value) -> Result<Value> {
+    let direct = std::env::var("BREADMEMORY_MCP_WRITES")
+        .map(|value| value.eq_ignore_ascii_case("direct"))
+        .unwrap_or(false);
+    if !direct {
+        bail!("retracting current context requires BREADMEMORY_MCP_WRITES=direct");
+    }
+    let key = required_str(args, "key")?;
+    let reason = optional_str(args, "reason");
+    let actor =
+        std::env::var("BREADMEMORY_MCP_ACTOR").unwrap_or_else(|_| "mcp-assistant".to_string());
+    let fact = context::retract(conn, &key, &actor, reason.as_deref())?;
+    Ok(json!({
+        "layer": "current_context",
+        "status": fact.status,
+        "fact": context::fact_to_json(&fact),
+        "actor": actor,
+    }))
+}
+
 fn historical_envelope(conn: &Connection, payload: Value) -> Value {
     let active_facts: i64 = conn
         .query_row(
@@ -634,6 +655,18 @@ fn tool_definitions() -> Vec<Value> {
                     "pinned": { "type": "boolean", "default": false, "description": "Pinned facts are always eligible for per-turn recall." }
                 },
                 "required": ["key", "value"]
+            }
+        }),
+        json!({
+            "name": "retract_current_context",
+            "description": "Retract an active current-context fact so it stops being injected. Requires BREADMEMORY_MCP_WRITES=direct; intended for local memory audits, not normal assistant use.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Current-context key to retract." },
+                    "reason": { "type": "string", "description": "Why the fact is being removed." }
+                },
+                "required": ["key"]
             }
         }),
     ]

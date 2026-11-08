@@ -265,6 +265,13 @@ enum ContextCommand {
         replace: bool,
         #[arg(long, help = "Upsert facts by key without deleting existing rows")]
         merge: bool,
+        #[arg(
+            long,
+            value_name = "SOURCE_KIND",
+            conflicts_with_all = ["replace", "merge"],
+            help = "Replace only facts from this source, leaving other sources intact"
+        )]
+        replace_source: Option<String>,
         #[arg(long, env = "BREADMEMORY_ACTOR", default_value = "cli")]
         actor: String,
     },
@@ -860,13 +867,18 @@ fn context_command(db_path: &std::path::Path, command: ContextCommand) -> Result
             file,
             replace,
             merge,
+            replace_source,
             actor,
         } => {
             let document: Value = serde_json::from_slice(
                 &std::fs::read(&file).with_context(|| format!("read {}", file.display()))?,
             )
             .with_context(|| format!("parse {}", file.display()))?;
-            if merge {
+            if let Some(source_kind) = replace_source {
+                let count =
+                    context::replace_source_json(&mut conn, &document, &actor, &source_kind)?;
+                println!("Replaced source '{source_kind}' with {count} fact(s).");
+            } else if merge {
                 let count = context::merge_json(&mut conn, &document, &actor)?;
                 println!("Merged {count} current-context fact(s).");
             } else {

@@ -12,5 +12,6 @@ pub mod importer;
 pub mod mcp;
 pub mod render;
 pub mod search;
+pub mod sms;
 pub mod text;
 pub mod util;

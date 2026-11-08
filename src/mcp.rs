@@ -570,7 +570,7 @@ fn tool_definitions() -> Vec<Value> {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 12, "default": 8 },
                     "mode": { "type": "string", "enum": ["auto", "keyword", "hybrid", "semantic"], "default": "auto", "description": "auto uses hybrid when embeddings exist, otherwise keyword." },
                     "rrf_k": { "type": "number", "minimum": 1, "maximum": 1000, "default": 60, "description": "Reciprocal Rank Fusion constant." },
-                    "role": { "type": "string", "enum": ["user", "assistant", "tool", "system"], "description": "Only return messages from this author role." },
+                    "role": { "type": "string", "enum": ["user", "assistant", "tool", "system", "contact"], "description": "Only return messages from this author role. Use contact for the other human in an imported SMS or chat thread." },
                     "after": { "type": "string", "description": "Only conversations created on or after this date (YYYY-MM-DD or RFC 3339)." },
                     "before": { "type": "string", "description": "Only conversations created on or before this date (YYYY-MM-DD or RFC 3339)." },
                     "include_hidden": { "type": "boolean", "default": false, "description": "Include system prompts, hidden context and reasoning traces." },

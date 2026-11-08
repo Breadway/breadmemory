@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use breadmemory::context::SetRequest;
 use breadmemory::importer::ImportOptions;
 use breadmemory::util::{parse_time_bound, truncate_chars};
-use breadmemory::{context, db, embedding, eval, importer, mcp, render, search};
+use breadmemory::{context, db, embedding, eval, importer, mcp, render, search, sms};
 
 #[derive(Parser)]
 #[command(
@@ -36,6 +36,18 @@ struct Cli {
 enum Command {
     /// Create the database and private data directory
     Init,
+
+    /// Import a merged SMS thread JSON as an archived conversation
+    #[command(name = "import-sms")]
+    ImportSms {
+        path: PathBuf,
+        #[arg(long, help = "Stable conversation id; defaults to sms-<filename>")]
+        id: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Import a ChatGPT export zip or an extracted export directory
     Import {
@@ -328,6 +340,39 @@ fn run() -> Result<()> {
                 "Attachments directory: {}",
                 home.join("attachments").display()
             );
+            Ok(())
+        }
+
+        Command::ImportSms {
+            path,
+            id,
+            title,
+            json,
+        } => {
+            let mut conn = db::open(&db_path)?;
+            let options = ImportOptions::new(home.clone());
+            let result =
+                sms::import_sms(&mut conn, &path, id.as_deref(), title.as_deref(), options)?;
+            if json {
+                print_json(&json!({
+                    "conversation_id": result.conversation_id,
+                    "messages": result.messages,
+                    "first_timestamp": result.first_ts,
+                    "last_timestamp": result.last_ts,
+                    "stored_source": result.stored_source.display().to_string(),
+                    "import": result.report.to_json(),
+                }))?;
+            } else {
+                print!("{}", render::render_import(&result.report));
+                println!(
+                    "SMS thread: {} ({} messages, {:.0} to {:.0})",
+                    result.conversation_id,
+                    result.messages,
+                    result.first_ts.unwrap_or(0.0),
+                    result.last_ts.unwrap_or(0.0)
+                );
+                println!("Preserved source: {}", result.stored_source.display());
+            }
             Ok(())
         }
 

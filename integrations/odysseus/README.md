@@ -100,3 +100,6 @@ selects `mcp__breadmemory__search_conversations` and the other breadmemory
 tools instead of reporting that no such tool exists. Verified with
 `requested_capabilities()` and `resolve_turn_contract()` inside the running
 container: the query resolves to family `breadmemory` and offers all six tools.
+
+The family pins the current MCP server id (`8a8c0ff2e107`). If the breadmemory
+server row is deleted and re-added, update that id in `FAMILY_TOOLS`.

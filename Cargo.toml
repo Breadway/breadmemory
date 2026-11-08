@@ -17,6 +17,7 @@ sha2 = "0.10"
 tempfile = "3"
 tokenizers = "0.22"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
+ureq = { version = "2", default-features = false, features = ["json"] }
 zstd = "0.13"
 
 [dev-dependencies]

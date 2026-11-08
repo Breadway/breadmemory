@@ -263,6 +263,8 @@ enum ContextCommand {
         file: PathBuf,
         #[arg(long, help = "Delete existing facts before restoring")]
         replace: bool,
+        #[arg(long, help = "Upsert facts by key without deleting existing rows")]
+        merge: bool,
         #[arg(long, env = "BREADMEMORY_ACTOR", default_value = "cli")]
         actor: String,
     },
@@ -857,14 +859,20 @@ fn context_command(db_path: &std::path::Path, command: ContextCommand) -> Result
         ContextCommand::Import {
             file,
             replace,
+            merge,
             actor,
         } => {
             let document: Value = serde_json::from_slice(
                 &std::fs::read(&file).with_context(|| format!("read {}", file.display()))?,
             )
             .with_context(|| format!("parse {}", file.display()))?;
-            let count = context::import_json(&mut conn, &document, &actor, replace)?;
-            println!("Restored {count} current-context fact(s).");
+            if merge {
+                let count = context::merge_json(&mut conn, &document, &actor)?;
+                println!("Merged {count} current-context fact(s).");
+            } else {
+                let count = context::import_json(&mut conn, &document, &actor, replace)?;
+                println!("Restored {count} current-context fact(s).");
+            }
             Ok(())
         }
 

@@ -705,6 +705,69 @@ pub fn import_json(
     Ok(count)
 }
 
+/// Merge facts from a JSON document by key without deleting existing rows.
+/// Existing active facts are updated through the normal audit path; new keys
+/// are inserted.
+pub fn merge_json(conn: &mut Connection, document: &Value, actor: &str) -> Result<usize> {
+    let facts = document
+        .get("facts")
+        .and_then(Value::as_array)
+        .context("current context file has no 'facts' array")?;
+    let mut count = 0usize;
+    for fact in facts {
+        let key = fact.get("key").and_then(Value::as_str).unwrap_or_default();
+        let value = fact
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if key.trim().is_empty() || value.trim().is_empty() {
+            continue;
+        }
+        let mut request = SetRequest::manual(key, value, actor);
+        request.category = fact
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("general")
+            .to_string();
+        request.confidence = fact
+            .get("confidence")
+            .and_then(Value::as_str)
+            .unwrap_or("stated")
+            .to_string();
+        request.status = fact
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|status| matches!(*status, "active" | "proposed"))
+            .unwrap_or("active")
+            .to_string();
+        request.source_kind = fact
+            .get("source_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("import")
+            .to_string();
+        request.source_conversation_id = fact
+            .get("source_conversation_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        request.source_message_id = fact
+            .get("source_message_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        request.source_quote = fact
+            .get("source_quote")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        request.note = fact.get("note").and_then(Value::as_str).map(str::to_string);
+        request.pinned = fact.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+        if request.validate().is_err() {
+            continue;
+        }
+        set_fact(conn, &request)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[derive(Debug, Default)]
 pub struct OdysseusImportReport {
     pub source: String,

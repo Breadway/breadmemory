@@ -8,6 +8,7 @@ use breadmemory::context;
 use breadmemory::db;
 use breadmemory::importer::{self, ImportOptions};
 use breadmemory::search;
+use breadmemory::sms;
 use breadmemory::util;
 
 const CONV_A: &str = r#"{
@@ -361,6 +362,60 @@ fn imports_zip_with_split_conversation_files() -> Result<()> {
 
     let report = importer::import(&mut conn, &zip_path, &ImportOptions::new(data.clone()))?;
     assert_eq!(report.conversations_unchanged, 2);
+
+    Ok(())
+}
+
+#[test]
+fn imports_a_corrected_sms_thread_and_is_idempotent() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let sms_path = temp.path().join("addi-merged.json");
+    std::fs::write(
+        &sms_path,
+        r#"[
+          {"ts":1700000000000,"side":"her","text":"Hi Riley","src":"pixel7"},
+          {"ts":1700000002000,"side":"you","text":"Hey Addi","src":"s20"}
+        ]"#,
+    )?;
+
+    let mut conn = db::open(&data.join("archive.db"))?;
+    let result = sms::import_sms(
+        &mut conn,
+        &sms_path,
+        Some("sms-test"),
+        Some("Corrected SMS thread"),
+        ImportOptions::new(data.clone()),
+    )?;
+    assert_eq!(result.messages, 2);
+    assert!(result.stored_source.exists());
+    assert_eq!(result.report.conversations_new, 1);
+
+    let detail = search::get_conversation(&conn, "sms-test", false, false, 10_000)?;
+    assert_eq!(detail.messages.len(), 2);
+    assert_eq!(detail.messages[0].role, "contact");
+    assert_eq!(detail.messages[1].role, "user");
+    assert_eq!(detail.messages[0].text, "Hi Riley");
+
+    let hits = search::search_keyword(
+        &conn,
+        "Riley",
+        &search::SearchOptions {
+            limit: 5,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].conversation_id, "sms-test");
+
+    let again = sms::import_sms(
+        &mut conn,
+        &sms_path,
+        Some("sms-test"),
+        Some("Corrected SMS thread"),
+        ImportOptions::new(data.clone()),
+    )?;
+    assert_eq!(again.report.conversations_unchanged, 1);
 
     Ok(())
 }

@@ -16,6 +16,7 @@ pub struct ImportOptions {
     pub force: bool,
     pub extract_attachments: bool,
     pub progress: bool,
+    pub source_label: Option<String>,
     pub data_dir: PathBuf,
     pub attachment_dir: PathBuf,
 }
@@ -27,6 +28,7 @@ impl ImportOptions {
             force: false,
             extract_attachments: true,
             progress: false,
+            source_label: None,
             data_dir,
             attachment_dir,
         }
@@ -205,20 +207,19 @@ pub fn import(conn: &mut Connection, path: &Path, options: &ImportOptions) -> Re
     let source_kind = archive.kind().as_str().to_string();
     let started_at = now_iso();
 
+    let source_label = options
+        .source_label
+        .clone()
+        .unwrap_or_else(|| path.display().to_string());
     conn.execute(
         "INSERT INTO imports(source_path, source_kind, source_sha256, started_at, status)
          VALUES (?1, ?2, ?3, ?4, 'running')",
-        params![
-            path.display().to_string(),
-            source_kind,
-            fingerprint,
-            started_at
-        ],
+        params![source_label, source_kind, fingerprint, started_at],
     )?;
     let import_id = conn.last_insert_rowid();
 
     let mut report = ImportReport {
-        source_path: path.display().to_string(),
+        source_path: source_label,
         source_kind,
         source_sha256: fingerprint.clone(),
         ..Default::default()

@@ -72,6 +72,7 @@ that directory: `archive.db` plus `attachments/`.
 | --- | --- |
 | `init` | Create the schema and private directories |
 | `import <path>` | Import a zip or extracted export directory |
+| `import-sms <file>` | Import a merged SMS thread JSON as an archived conversation |
 | `status [--json]` | Counts, size, schema version, last import |
 | `conversations` | List conversations, newest first |
 | `search <query>` | Hybrid BM25 plus semantic search with source ids and timestamps |
@@ -172,6 +173,35 @@ breadmemory eval cases.json --k 5 --compare
 It reports recall@k, MRR and average latency for each mode. `--json` emits the
 same metrics plus per-case ranks for comparing chunk sizes, RRF constants or
 future model changes.
+
+## SMS threads
+
+`import-sms` brings a corrected SMS thread into the same archive, so it is
+searchable with keyword and hybrid retrieval alongside ChatGPT conversations.
+
+Accepted format is a JSON array sorted or unsorted:
+
+```json
+[
+  {"ts": 1733302800493, "side": "her", "text": "Hi Riley", "src": "pixel7"},
+  {"ts": 1733302803354, "side": "you", "text": "Hey Addi", "src": "pixel7"}
+]
+```
+
+- `ts` is Unix milliseconds.
+- `side` is `you` or `her`.
+- `you` becomes role `user`; `her` becomes role `contact`.
+- The conversation id defaults to `sms-<filename>`; use `--id` for a stable id.
+- The original file is copied to `<data>/sms-sources/<sha256>.json` and the
+  import row points at the original path.
+- Re-importing a corrected file replaces the same conversation id when its
+  content hash changes, and is a no-op otherwise.
+
+```sh
+breadmemory import-sms ~/sms/addi-merged.json \
+  --id sms-addi-thread --title "SMS thread with Addi (corrected)"
+breadmemory embed
+```
 
 ## Storage
 
